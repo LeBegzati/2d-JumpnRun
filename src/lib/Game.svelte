@@ -1,12 +1,54 @@
 <script>
 	import { onMount } from 'svelte';
+	import { fade, scale } from 'svelte/transition';
 
 	let { width = '100vw', height = '100vh' } = $props();
 	
-	// STATE MACHINE: PRE_START -> INTRO -> MENU -> PLAY
+	// STATE MACHINE: PRE_START -> INTRO -> MENU -> TRANSITION_FLOWER -> STORY -> LOADING -> LEVEL_SELECT -> PLAY
 	let appState = $state('PRE_START'); 
 	let transitionActive = $state(false);
 	let isHoveringStart = $state(false);
+	let panFinished = $state(false);
+	let isWinking = $state(false);
+
+	// ============================================================
+	// STORY CONFIG — TIMESTAMPS (adjust to your story-voice.mp3!)
+	// Set startTime/endTime to the exact seconds in the audio file
+	// where each box's narration begins and ends.
+	// Run `console.log(storyVoice.currentTime)` in the browser
+	// console while playing to find the right values.
+	// ============================================================
+	const storyConfig = [
+		{
+			text: "Once, the kingdom shined in endless colors. The light of the crystals brought joy and life to every living soul.",
+			startTime: 0,     
+			endTime: 8.5,     
+			scene: "meadow"
+		},
+		{
+			text: "But a dark, nameless power has stolen the radiance, shroudding the world in grey shadows. all lives seems frozen...",
+			startTime: 9.0,
+			endTime: 18.0,
+			scene: "grey"
+		},
+		{
+			text: "Quadra, you are the only one who can break the darkness. Journey through the forgotten lands, find the lost fragments, and bring back the light!",
+			startTime: 18.5,
+			endTime: 30.0,
+			scene: "hope"
+		},
+		{
+			text: "The adventure begins... now.",
+			startTime: 30.5,
+			endTime: 34.0,
+			scene: "dawn"
+		}
+	];
+	let currentStoryBox = $state(0);
+	let displayedStoryText = $state("");
+	let storyInterval;
+	let storyTimeupdateHandler = null;
+	let isBlockFinished = $state(false);
 
 	// WEB AUDIO API SCHEDULING (PERFECT CROSSFADE)
 	let audioContext = null;
@@ -77,8 +119,7 @@
 		nextStartTime = fadeOutStart;
 	}
 
-	function toggleMute(e) {
-		if(e) e.stopPropagation();
+	function toggleMute() {
 		isMuted = !isMuted;
 		if (globalGain && audioContext) {
 			globalGain.gain.setTargetAtTime(isMuted ? 0 : 1, audioContext.currentTime, 0.05);
@@ -106,8 +147,7 @@
 	function startIntro() {
 		if (appState !== 'PRE_START') return;
 
-		// 1. Play immediate click SFX (Preloaded, Full Volume)
-		playClick();
+		// No click sound here to keep the pan absolutely calm and cinematic!
 
 		// 2. Init synchronous background orchestrator
 		initPerfectAudio();
@@ -118,22 +158,258 @@
 		// Trigger intro-to-menu drop after camera pan ends
 		setTimeout(() => {
 			appState = 'MENU';
+			panFinished = true; // Triggers the high-fidelity 'Pop' effects
 		}, 4800);
 	}
 
 	function startGame(e) {
 		e.stopPropagation();
 		transitionActive = true;
+		
+		// Fade out the menu music as requested
 		fadeOutMusic();
+
+		// Fade in map theme
+		try {
+			const mapTheme = document.getElementById('map-theme-audio');
+			if (mapTheme) {
+				mapTheme.volume = 0;
+				mapTheme.play().catch(err => console.log('Map theme block', err));
+				let vol = 0;
+				let fade = setInterval(() => {
+					vol += 0.05;
+					if (vol >= 0.6) {
+						clearInterval(fade);
+						mapTheme.volume = 0.6;
+					} else {
+						mapTheme.volume = vol;
+					}
+				}, 100);
+			}
+		} catch(err) {}
+
+		// Play cinematic start click
+		try {
+			const startClickSound = document.getElementById('click-effect-audio');
+			if (startClickSound) {
+				startClickSound.volume = 0.8;
+				startClickSound.currentTime = 0;
+				startClickSound.play().catch(err => console.log('SFX block', err));
+			}
+		} catch(err) {}
 
 		const rect = e.target.getBoundingClientRect();
 		fireConfetti(rect.left + rect.width / 2, rect.top + rect.height / 2);
 
+		appState = 'TRANSITION_FLOWER';
+
 		setTimeout(() => {
-			appState = 'PLAY';
+			appState = 'STORY';
 			transitionActive = false;
 			particles = [];
-		}, 2000);
+			currentStoryBox = 0;
+			startTypewriter();
+		}, 5000);
+	}
+
+	// ── AUDIO CLEANUP (Ghost Music Prevention) ──
+	$effect(() => {
+		return () => {
+			if (audioCtx) {
+				try { audioCtx.close(); } catch(e) {}
+			}
+			const audios = document.querySelectorAll('audio');
+			audios.forEach(a => {
+				try {
+					a.pause();
+					a.src = ""; // Force stop
+					a.load();
+					a.remove();
+				} catch(e) {}
+			});
+		};
+	});
+
+	function startTypewriter() {
+		const storyVoice = document.getElementById('story-voice-audio');
+		isBlockFinished = false;
+		displayedStoryText = "";
+		let i = 0;
+		if (storyInterval) clearInterval(storyInterval);
+
+		const currentBox = storyConfig[currentStoryBox];
+		const currentText = currentBox.text;
+
+		// --------------------------------------------------------
+		// Shared trigger: called by EITHER audio segment end
+		// OR typewriter fallback — whichever fires first
+		// --------------------------------------------------------
+		let triggered = false;
+		function triggerBlockFinished() {
+			if (triggered) return;
+			triggered = true;
+			isBlockFinished = true;
+			// Unducking: Raise active music back to 60%
+			fadeAudio('map-theme-audio', 0.6, 600);
+			fadeAudio('corruption-theme-audio', 0.6, 600);
+		}
+
+		if (storyVoice) {
+			// Remove any old timeupdate handler first
+			if (storyTimeupdateHandler) {
+				storyVoice.removeEventListener('timeupdate', storyTimeupdateHandler);
+				storyTimeupdateHandler = null;
+			}
+			storyVoice.onended = null;
+
+			// DUCKING: Reduce volume of ALL background music while narrator speaks
+			fadeAudio('map-theme-audio', 0.2, 400);
+			fadeAudio('corruption-theme-audio', 0.2, 400);
+
+			// seek to this box's segment and play
+			storyVoice.currentTime = currentBox.startTime;
+			storyVoice.play().catch(err => console.log('Voice block', err));
+
+			// ── TIMESTAMP GUARD: fires as soon as currentTime >= endTime ──
+			storyTimeupdateHandler = () => {
+				if (storyVoice.currentTime >= currentBox.endTime) {
+					// Instantly pause — no dead air, no 20-second wait
+					storyVoice.pause();
+					storyVoice.removeEventListener('timeupdate', storyTimeupdateHandler);
+					storyTimeupdateHandler = null;
+					triggerBlockFinished();
+				}
+			};
+			storyVoice.addEventListener('timeupdate', storyTimeupdateHandler);
+
+			// Safety: if audio ends before reaching endTime (file shorter than expected)
+			storyVoice.onended = () => {
+				if (storyTimeupdateHandler) {
+					storyVoice.removeEventListener('timeupdate', storyTimeupdateHandler);
+					storyTimeupdateHandler = null;
+				}
+				triggerBlockFinished();
+			};
+
+			// HARD DEADLINE
+			const segmentDuration = currentBox.endTime - currentBox.startTime;
+			setTimeout(() => {
+				if (!triggered) {
+					storyVoice.pause();
+					if (storyTimeupdateHandler) {
+						storyVoice.removeEventListener('timeupdate', storyTimeupdateHandler);
+						storyTimeupdateHandler = null;
+					}
+					triggerBlockFinished();
+				}
+			}, (segmentDuration + 1.0) * 1000);
+		}
+
+		// Typewriter: EXACT calibration for millisecond sync if audio exists
+		let typingSpeed = 40; // Default speed for silent boxes
+		
+		if (currentBox.endTime !== undefined && currentBox.startTime !== undefined) {
+			const audioDurationForText = currentBox.endTime - currentBox.startTime;
+			typingSpeed = Math.max(20, Math.floor((audioDurationForText * 1000) / currentText.length));
+		}
+
+		storyInterval = setInterval(() => {
+			if (i < currentText.length) {
+				displayedStoryText += currentText.charAt(i);
+				i++;
+			} else {
+				clearInterval(storyInterval);
+				// Fallback: if no audio, show button immediately after text
+				if (!storyVoice || storyVoice.paused) {
+					setTimeout(triggerBlockFinished, 400);
+				}
+			}
+		}, typingSpeed);
+	}
+
+	function nextStoryBox() {
+		if (!isBlockFinished) return;
+		playClick();
+		currentStoryBox++;
+		
+		if (currentStoryBox < storyConfig.length) {
+			const scene = storyConfig[currentStoryBox].scene;
+			
+			// Audio logic simplified (keeping Map Theme consistent)
+			if (scene === 'grey') {
+				// We keep the map theme but maybe lower volume or keep as is
+			}
+			
+			startTypewriter();
+		} else {
+			finishStory();
+		}
+	}
+
+	function fadeAudio(id, targetVolume, duration = 500) {
+		const el = document.getElementById(id);
+		if (!el) return;
+		
+		if (targetVolume > 0 && el.paused) {
+			el.volume = 0;
+			el.play().catch(e => {});
+		}
+
+		let currentVol = el.volume;
+		const steps = 10;
+		const stepAmt = (targetVolume - currentVol) / steps;
+		let i = 0;
+		
+		const interval = setInterval(() => {
+			i++;
+			currentVol += stepAmt;
+			el.volume = Math.max(0, Math.min(1, currentVol));
+			if (i >= steps) {
+				clearInterval(interval);
+				el.volume = targetVolume;
+				if (targetVolume === 0) el.pause();
+			}
+		}, duration / steps);
+	}
+
+	function finishStory() {
+		if (storyInterval) clearInterval(storyInterval);
+		// Clean up any active timeupdate handler
+		const storyVoice = document.getElementById('story-voice-audio');
+		if (storyVoice) {
+			if (storyTimeupdateHandler) {
+				storyVoice.removeEventListener('timeupdate', storyTimeupdateHandler);
+				storyTimeupdateHandler = null;
+			}
+			storyVoice.pause();
+		}
+		// POST-INTRO: raise map theme permanently to 60%
+		fadeAudio('map-theme-audio', 0.6, 1000);
+
+		appState = 'LOADING';
+		setTimeout(() => {
+			appState = 'LEVEL_SELECT';
+		}, 2500);
+	}
+
+	function startLevel1() {
+		try {
+			const mapTheme = document.getElementById('map-theme-audio');
+			if (mapTheme) {
+				let vol = mapTheme.volume;
+				let fade = setInterval(() => {
+					vol -= 0.05;
+					if (vol <= 0) {
+						clearInterval(fade);
+						mapTheme.pause();
+					} else {
+						mapTheme.volume = vol;
+					}
+				}, 100);
+			}
+		} catch(err) {}
+		
+		appState = 'PLAY';
 	}
 
 	// MOUSE TRACKING
@@ -143,7 +419,7 @@
 	let mouseY = $state(0);
 
 	function handleMouseMove(e) {
-		if (appState !== 'MENU') return;
+		if (appState !== 'MENU' && appState !== 'LEVEL_SELECT') return;
 		mouseX = (e.clientX / windowWidth) * 2 - 1;
 		mouseY = (e.clientY / windowHeight) * 2 - 1;
 	}
@@ -214,18 +490,23 @@
 	<link href="https://fonts.googleapis.com/css2?family=Lilita+One&display=swap" rel="stylesheet">
 </svelte:head>
 
-<div class="game-viewport bloom-scene" style="width: {width}; height: {height};">
+<div class="game-viewport bloom-scene {appState === 'TRANSITION_FLOWER' || appState === 'STORY' ? 'flower-bloom-active' : ''}" style="width: {width}; height: {height};">
 	<div class="texture-overlay"></div>
 
-	<!-- PRELOAD CLICK SOUND FOR INSTANT ZERO-LATENCY PLAYBACK -->
+	<!-- PRELOAD SOUNDS FOR INSTANT ZERO-LATENCY PLAYBACK -->
 	<audio id="click-audio" src="/audio/mixkit-select-click-1109.wav" preload="auto"></audio>
+	<audio id="click-effect-audio" src="/audio/mixkit-select-click-1109.wav" preload="auto"></audio>
+	<audio id="story-voice-audio" src="/story-voice.mp3" preload="auto"></audio>
+	<!-- map-theme: rename the file from "map-theme.mp3.mp3" → "map-theme.mp3" in static/audio/ -->
+	<audio id="map-theme-audio" src="/audio/map-theme.mp3" loop preload="auto"></audio>
 
 	<!-- BACKGROUND VISUALS (Persistent layer, transitions smoothly) -->
-	{#if appState !== 'PLAY'}
+	{#if appState !== 'PLAY' && appState !== 'LEVEL_SELECT' && appState !== 'LOADING'}
 		<div class="parallax-container 
 			{appState === 'PRE_START' ? 'pan-static' : ''} 
 			{appState === 'INTRO' ? 'pan-active' : ''} 
-			{appState === 'MENU' ? 'pan-ended' : ''}">
+			{appState === 'MENU' ? 'pan-ended' : ''}
+			{appState === 'TRANSITION_FLOWER' || appState === 'STORY' ? 'pan-flower-bloom' : ''}">
 			
 			<div class="layer sky"></div>
 
@@ -241,6 +522,7 @@
 			</div>
 
 			<div class="layer clouds">
+				<div class="wonder-sun-happy menu-sun"></div>
 				<div class="cloud" style="top: 10vh; left: 20vw; transform: scale(3);"></div>
 				<div class="cloud" style="top: 25vh; left: 80vw; transform: scale(1.5);"></div>
 				<div class="cloud" style="top: 15vh; left: 140vw; transform: scale(4);"></div>
@@ -286,7 +568,7 @@
 			<p class="splash-pulse">CLICK TO ENTER THE KINGDOM</p>
 		</div>
 
-	{:else if appState === 'MENU'}
+	{:else if appState === 'MENU' || appState === 'TRANSITION_FLOWER'}
 
 		<!-- 3. MENU (Buttons, Title, Logic ready) -->
 		<div class="menu-screen {transitionActive ? 'fade-away' : ''}">
@@ -331,7 +613,7 @@
 			</div>
 		</div>
 
-		<!-- MENU -> PLAY TRANSFORMATION OVERLAYS -->
+		<!-- MENU -> TRANSITION FLOWER OVERLAYS -->
 		{#if transitionActive}
 			<div class="particles">
 				{#each particles as p (p.id)}
@@ -351,10 +633,208 @@
 			</div>
 		{/if}
 
+	{:else if appState === 'STORY'}
+
+		<!-- STORY OVERLAY: CINEMATIC VFX BACKGROUNDS -->
+		<div class="story-overlay story-scene-{storyConfig[currentStoryBox]?.scene ?? 'meadow'}"
+			 in:fade={{ duration: 800 }}
+			 onclick={nextStoryBox}>
+
+			<!-- ═══ SCENE 1: PARADISE SUNRISE ═══
+			     God-Rays + Floating Petal Particles -->
+			{#if storyConfig[currentStoryBox]?.scene === 'meadow'}
+				<div class="scene-bg scene-meadow">
+					<!-- Majestic Kingdom Backdrop -->
+					<div class="kingdom-backdrop">
+						<div class="wonder-sun-happy"></div>
+					</div>
+					<!-- Animated sunrise gradient overlay -->
+					<div class="sunrise-overlay"></div>
+					<!-- God-rays: 7 conic beams from top-center -->
+					<div class="god-rays">
+						{#each Array(7) as _, r}
+							<div class="god-ray" style="--r:{r}; animation-delay: {r * 0.4}s"></div>
+						{/each}
+					</div>
+					<!-- Floating petal particles -->
+					<div class="petal-layer">
+						{#each dust.slice(0, 20) as d}
+							<div class="petal" style="
+								left: {d.left * 0.4}vw;
+								animation-duration: {d.duration * 0.8}s;
+								animation-delay: -{d.delay * 0.5}s;
+								font-size: {10 + d.size * 3}px;
+							">🌸</div>
+						{/each}
+					</div>
+					<!-- Glowing sun orb -->
+					<div class="vfx-sun"></div>
+				</div>
+			{/if}
+
+			<!-- ═══ SCENE 2: THE DECAY ═══
+			     Grayscale Fade + Ash Particles + Demon King -->
+			{#if storyConfig[currentStoryBox]?.scene === 'grey'}
+				<div class="scene-bg scene-grey {isBlockFinished ? '' : 'shaking'}">
+					<!-- NEW: Demon King Silhouette looming in background -->
+					<div class="demon-king-shadow">
+						<div class="demon-eye-glow"></div>
+					</div>
+					<!-- Desaturation overlay that animates from color to B&W -->
+					<div class="grey-desaturate"></div>
+					<!-- Fog layers -->
+					<div class="fog fog-1"></div>
+					<div class="fog fog-2"></div>
+					<div class="fog fog-3"></div>
+					<!-- Falling ash particles -->
+					<div class="ash-layer">
+						{#each dust.slice(0, 25) as d}
+							<div class="ash-particle" style="
+								left: {d.left * 0.4}vw;
+								width: {d.size * 1.5}px;
+								height: {d.size * 1.5}px;
+								animation-duration: {d.duration * 0.7}s;
+								animation-delay: -{d.delay * 0.4}s;
+								opacity: {0.3 + Math.random() * 0.5};
+							"></div>
+						{/each}
+					</div>
+				</div>
+			{/if}
+
+			<!-- ═══ SCENE 3: THE SPOTLIGHT (Cosmic Silence) ═══ -->
+			{#if storyConfig[currentStoryBox]?.scene === 'hope'}
+				<div class="scene-bg scene-spotlight">
+					<div class="cosmos-shimmer"></div>
+					<div class="central-spotlight"></div>
+					<div class="golden-dust">
+						{#each Array(15) as _, i}
+							<div class="gold-particle" style="--delay:{i*0.3}s; --x:{Math.random()*100}%; --y:{Math.random()*100}%"></div>
+						{/each}
+					</div>
+					<div class="spotlight-center-container">
+						{#key currentStoryBox}
+							<div class="hero-quadra">
+								<div class="cubie divine-float">
+									<div class="eyes"><div class="eye"><div class="pupil"></div></div><div class="eye"><div class="pupil"></div></div></div>
+								</div>
+							</div>
+						{/key}
+					</div>
+				</div>
+			{/if}
+
+			<!-- ═══ SCENE 4: THE GOLDEN HORIZON (The Liberation) ═══ -->
+			{#if storyConfig[currentStoryBox]?.scene === 'dawn'}
+				<div class="scene-bg scene-hero">
+					<div class="victory-flash-overlay"></div>
+					<!-- Hill Silhouettes for Depth -->
+					<div class="golden-hills">
+						<div class="hill-layer hill-far"></div>
+						<div class="hill-layer hill-mid"></div>
+						<div class="hill-layer hill-near"></div>
+						<div class="valley-fog"></div>
+					</div>
+					<!-- Wonder Energy Sparks -->
+					<div class="wonder-energy-layer">
+						{#each Array(20) as _, i}
+							<div class="energy-spark" style="--delay:{i*0.2}s; --x:{Math.random()*100}%"></div>
+						{/each}
+					</div>
+					<div class="spotlight-center-container">
+						{#key currentStoryBox}
+							<div class="hero-quadra hero-jump">
+								<div class="cubie hero-cubie salto-anim">
+									<div class="eyes"><div class="eye"><div class="pupil"></div></div><div class="eye"><div class="pupil"></div></div></div>
+									<div class="hero-trail"></div>
+								</div>
+							</div>
+						{/key}
+					</div>
+				</div>
+			{/if}
+
+			<!-- TEXT BOX (always on top, at bottom of screen) -->
+			<div class="rpg-text-box cute-box">
+				<p class="story-scene-label">Chapter {currentStoryBox + 1} / {storyConfig.length}</p>
+				<p class="story-body">{displayedStoryText}</p>
+				{#if isBlockFinished}
+					<span class="click-to-continue" in:fade>
+						{currentStoryBox < storyConfig.length - 1 ? 'Click for Next ▼' : 'Begin the Quest ▶'}
+					</span>
+				{/if}
+			</div>
+		</div>
+
+	{:else if appState === 'LOADING'}
+
+		<!-- KNUFFIGER LOADING SCREEN -->
+		<div class="loading-screen kingdom-loading" in:fade={{ duration: 500 }} out:fade={{ duration: 800 }}>
+			<div class="loading-meadow"></div>
+			<div class="cubie loading-run">
+				<div class="eyes">
+					<div class="eye"><div class="pupil"></div></div>
+					<div class="eye"><div class="pupil"></div></div>
+				</div>
+			</div>
+			<div class="loading-text">Gathering the colors of the kingdom...</div>
+		</div>
+
+	{:else if appState === 'LEVEL_SELECT'}
+
+		<!-- BUNTES KÖNIGREICH LEVEL SELECT -->
+		<div class="level-select-screen" in:fade={{ duration: 1000 }}>
+			
+			<div class="kingdom-bg">
+				<div class="k-sky"></div>
+				<div class="k-sun"></div>
+				<div class="k-clouds">
+					<div class="k-cloud" style="top: 10%; left: 10%;"></div>
+					<div class="k-cloud" style="top: 20%; left: 70%; transform: scale(1.5);"></div>
+				</div>
+				<div class="k-hills"></div>
+				<div class="k-river"></div>
+			</div>
+
+			<h2 class="level-select-title">CHOOSE YOUR PATH</h2>
+			
+			<div class="levels-container">
+				<!-- Level 1 (Windmühle) -->
+				<button class="k-level-node active-node" style="left: 20%; top: 30%;" onclick={startLevel1} onmousedown={playClick}>
+					<div class="node-icon windmill">
+						<div class="wm-base"></div>
+						<div class="wm-blades"></div>
+					</div>
+					<div class="node-label">1. WONDER PLAINS</div>
+				</button>
+				
+				<!-- Level 2 (Eisschloss) -->
+				<div class="k-level-node locked-node" style="left: 50%; top: 50%;">
+					<div class="node-icon ice-castle">
+						<div class="ic-tower"></div>
+						<div class="ic-tower tall"></div>
+						<div class="ic-tower"></div>
+					</div>
+					<div class="node-label">2. CRYSTAL CAVES</div>
+					<div class="lock-icon">🔒</div>
+				</div>
+
+				<!-- Level 3 (Vulkan) -->
+				<div class="k-level-node locked-node" style="left: 75%; top: 20%;">
+					<div class="node-icon volcano">
+						<div class="vc-body"></div>
+						<div class="vc-lava"></div>
+					</div>
+					<div class="node-label">3. FORGOTTEN PEAK</div>
+					<div class="lock-icon">🔒</div>
+				</div>
+			</div>
+		</div>
+
 	{:else if appState === 'PLAY'}
 
 		<!-- 4. PLAY PHASE -->
-		<div class="game-world">
+		<div class="game-world" in:fade={{ duration: 1000 }}>
 			<h2>LEVEL 1: WONDER PLAINS</h2>
 			<div class="platformer-view">[ PLACEHOLDER ]<br/>Das eigentliche Spiel-Level wird hier später implementiert.</div>
 		</div>
@@ -417,7 +897,7 @@
 	.parallax-container {
 		position: absolute;
 		top: 0; left: 0;
-		width: 250vw; /* Extremely wide */
+		width: 300vw; /* Extremely wide to prevent black borders during pan/scale */
 		height: 100vh;
 	}
 	.pan-static {
@@ -435,7 +915,7 @@
 	}
 
 	/* SCENERY SETTINGS */
-	.sky { background: linear-gradient(180deg, #74b9ff 0%, #a29bfe 60%, #dfe6e9 100%); width: 250vw; }
+	.sky { background: linear-gradient(180deg, #74b9ff 0%, #a29bfe 60%, #dfe6e9 100%); width: 300vw; }
 	
 	.dust-mote {
 		position: absolute; background: #fff; border-radius: 50%;
@@ -472,12 +952,18 @@
 		height: 40vh; left: -25vw; bottom: -5vh;
 		background: linear-gradient(135deg, #55efc4, #00b894);
 		box-shadow: 0 0 40px rgba(0,0,0,0.1);
+		animation: hillBounce 4s infinite ease-in-out;
 	}
 	.hill-fg {
 		height: 35vh; left: -25vw; bottom: -10vh;
 		background: linear-gradient(135deg, #ffeaa7, #fdcb6e);
 		border-top: 20px solid #00b894;
 		box-shadow: 0 -10px 30px rgba(0,0,0,0.2);
+		animation: hillBounce 3s infinite ease-in-out alternate;
+	}
+	@keyframes hillBounce {
+		0%, 100% { transform: scaleY(1); }
+		50% { transform: scaleY(1.08) skewX(2deg); }
 	}
 
 	.tower { position: absolute; bottom: 5vh; width: 80px; }
@@ -504,15 +990,17 @@
 		position: absolute; left: 110vw; bottom: 30vh;
 		width: 80px; height: 80px;
 		background: radial-gradient(circle at 35% 35%, #ff7675, #d63031);
-		border-radius: 40% 40% 45% 45%; 
+		border-radius: 15px; 
 		box-shadow: 0 15px 25px rgba(214, 48, 49, 0.5), inset -8px -12px 20px rgba(0,0,0,0.3);
 		display: flex; justify-content: center; align-items: center; padding-top: 10px;
+		animation: wonderJump 2s infinite ease-in-out;
 	}
-	.cameo-flip { animation: flipOver 2s cubic-bezier(0.4, 0, 0.2, 1) 1.5s forwards; }
-	@keyframes flipOver {
-		0% { transform: translateY(0) rotate(0); }
-		50% { transform: translateY(-30vh) rotate(180deg); }
-		100% { transform: translateY(0) rotate(360deg); }
+	@keyframes wonderJump {
+		0% { transform: translateY(0) rotate(0deg) scale(1.2, 0.8); }
+		25% { transform: translateY(-100px) rotate(90deg) scale(0.9, 1.1); }
+		50% { transform: translateY(-180px) rotate(180deg) scale(1, 1); }
+		75% { transform: translateY(-80px) rotate(270deg) scale(0.9, 1.1); }
+		100% { transform: translateY(0) rotate(360deg) scale(1.2, 0.8); }
 	}
 
 	/* --- MENU SCREEN --- */
@@ -553,6 +1041,11 @@
 		border-radius: 40% 40% 45% 45%; 
 		box-shadow: 0 15px 25px rgba(214, 48, 49, 0.5), inset -8px -12px 20px rgba(0,0,0,0.3);
 		display: flex; justify-content: center; align-items: center; padding-top: 10px;
+		transition: transform 0.2s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+	}
+	/* Disable transition when an animation is active to prevent jitter */
+	.cubie:is(.idle, .jumping-happily, .salto-anim, .rocket-fly) {
+		transition: none !important;
 	}
 	.eyes { display: flex; gap: 16px; }
 	.eye {
@@ -609,12 +1102,14 @@
 		font-size: 16px; padding: 12px 30px;
 		background: #00cec9; border: 4px solid #fff; text-shadow: 1px 1px 0 #01908c;
 		box-shadow: 0 6px 0 #01908c, 0 10px 15px rgba(0,0,0,0.3);
+		transform: none !important; /* Keep absolutely static as requested */
 	}
 	.small-btn:hover {
-		transform: scale(1.05) translateY(-4px); box-shadow: 0 10px 0 #01908c, 0 15px 20px rgba(0,0,0,0.4);
+		filter: brightness(1.1);
+		box-shadow: 0 6px 0 #01908c, 0 10px 15px rgba(0,0,0,0.3);
 	}
 	.small-btn:active {
-		transform: scale(0.95) translateY(2px); box-shadow: 0 4px 0 #01908c, 0 5px 10px rgba(0,0,0,0.3);
+		transform: scale(0.98) !important;
 	}
 	.mute-btn { padding: 12px 20px; border-radius: 50%; font-size: 18px; line-height: 1; text-shadow: none; }
 
@@ -644,6 +1139,586 @@
 		position: absolute; inset: 0; background: #55efc4; z-index: 50; display: flex; flex-direction: column;
 		align-items: center; justify-content: center; color: #2d3436;
 	}
-	.platformer-view { font-size: 2rem; margin-top: 20px; }
+	.platformer-view { font-size: 2rem; margin-top: 20px; text-align: center; }
+
+	/* --- NEW PHASES CSS --- */
+	.flower-bloom-active {
+		animation: worldBloom 5s ease-out forwards;
+	}
+	@keyframes worldBloom {
+		0% { filter: drop-shadow(0 0 10px rgba(255,255,255,0.1)) saturate(1.1); }
+		100% { filter: drop-shadow(0 0 40px rgba(255,200,255,0.6)) saturate(1.8) hue-rotate(15deg) brightness(1.2); }
+	}
+
+	.pan-flower-bloom {
+		/* Glides from the MENU pan-ended state to even further right, very smoothly */
+		animation: flowerPan 5s cubic-bezier(0.25, 1, 0.5, 1) forwards;
+	}
+	@keyframes flowerPan {
+		0% { transform: translateX(-150vw); }
+		100% { transform: translateX(-180vw) scale(1.1); }
+	}
+
+	/* ============================================
+	   STORY OVERLAY & CINEMATIC SCENES
+	   ============================================ */
+	.story-overlay {
+		position: absolute; inset: 0; z-index: 60;
+		display: flex; flex-direction: column; justify-content: flex-end; align-items: center;
+		padding-bottom: 8vh; cursor: pointer; overflow: hidden;
+	}
+	.scene-bg { position: absolute; inset: 0; pointer-events: none; overflow: hidden; }
+
+	/* SCENE 1: PARADISE SUNRISE — God-Rays + Petals */
+	.story-scene-meadow { background: #0a0010; }
+	.scene-meadow {
+		background: linear-gradient(180deg, #2c1654 0%, #a8520a 35%, #f8b500 60%, #55efc4 100%);
+		animation: sunriseShift 8s ease-out forwards;
+	}
+	@keyframes sunriseShift {
+		0% { filter: brightness(0.4) saturate(0.5); }
+		100% { filter: brightness(1.1) saturate(1.3); }
+	}
+	.sunrise-overlay {
+		position: absolute; inset: 0;
+		background: linear-gradient(180deg, rgba(255,150,50,0.5) 0%, transparent 60%);
+		animation: sunriseGlow 6s ease-out infinite alternate;
+	}
+	@keyframes sunriseGlow { 0% { opacity: 0.3; } 100% { opacity: 0.9; } }
+	.god-rays { position: absolute; inset: 0; display: flex; justify-content: center; }
+	.god-ray {
+		position: absolute; top: -10%; left: 48%; width: 60px; height: 130%;
+		background: linear-gradient(180deg, rgba(255,234,167,0.55) 0%, transparent 100%);
+		transform-origin: top center;
+		transform: translateX(-50%) rotate(calc((var(--r) - 3) * 15deg));
+		animation: godRayPulse 4s ease-in-out infinite alternate; filter: blur(8px);
+	}
+	@keyframes godRayPulse {
+		0% { opacity: 0.2; transform: translateX(-50%) rotate(calc((var(--r) - 3) * 15deg)) scaleX(0.8); }
+		100% { opacity: 0.8; transform: translateX(-50%) rotate(calc((var(--r) - 3) * 15deg)) scaleX(1.3); }
+	}
+	.vfx-sun {
+		position: absolute; top: 10%; left: 42%; transform: translateX(-50%);
+		width: 180px; height: 180px; border-radius: 50%;
+		background: radial-gradient(circle, #fff 10%, #ffeaa7 45%, transparent 75%);
+		box-shadow: 0 0 130px 70px rgba(255,234,167,0.8), 0 0 280px 130px rgba(255,150,50,0.4);
+		animation: sunPulse 3s ease-in-out infinite alternate;
+	}
+	.petal-layer { position: absolute; inset: 0; }
+	.petal { position: absolute; bottom: -5%; animation: petalFloat linear infinite; }
+	@keyframes petalFloat {
+		0% { transform: translateY(0) rotate(0deg); opacity: 0; }
+		10% { opacity: 1; }
+		90% { opacity: 0.8; }
+		100% { transform: translateY(-110vh) rotate(360deg); opacity: 0; }
+	}
+	@keyframes sunPulse {
+		0% { box-shadow: 0 0 80px 40px rgba(255,234,167,0.6), 0 0 160px 80px rgba(255,150,50,0.3); transform: translateX(-50%) scale(1); }
+		100% { box-shadow: 0 0 160px 80px rgba(255,234,167,0.95), 0 0 320px 160px rgba(255,150,50,0.5); transform: translateX(-50%) scale(1.08); }
+	}
+
+	/* SCENE 2: THE DECAY — Grayscale + Ash Particles */
+	.story-scene-grey { background: #1a1a1a; }
+	.scene-grey {
+		background: linear-gradient(180deg, #4a6741 0%, #3d4a3e 30%, #2d3436 100%);
+		animation: greyDecay 3s ease-out forwards;
+	}
+	@keyframes greyDecay {
+		0% { filter: saturate(1) brightness(1); }
+		100% { filter: saturate(0) brightness(0.6); }
+	}
+	/* THE DEMON KING SILHOUETTE */
+	.demon-king-shadow {
+		position: absolute; top: 0; left: 50%; transform: translateX(-50%);
+		width: 100vw; height: 100vh;
+		background: radial-gradient(ellipse at top center, rgba(10,0,0,0.9) 0%, transparent 60%);
+		opacity: 0;
+		animation: demonLoom 4s ease-out forwards 1s;
+	}
+	.demon-king-shadow::after {
+		content: ''; position: absolute; top: 15%; left: 50%; transform: translateX(-50%);
+		width: 40vmin; height: 50vmin;
+		background: 
+			radial-gradient(circle at 35% 30%, #ff0000 0%, transparent 10%), /* left eye */
+			radial-gradient(circle at 65% 30%, #ff0000 0%, transparent 10%), /* right eye */
+			radial-gradient(ellipse at center, #050505 0%, #000 50%, transparent 70%); /* head/body */
+		filter: blur(12px); opacity: 0.8;
+		animation: demonLaugh 0.5s infinite alternate ease-in-out;
+	}
+	@keyframes demonLaugh {
+		0% { transform: translateX(-50%) translateY(0) scale(1); filter: blur(12px) brightness(1); }
+		100% { transform: translateX(-50%) translateY(-5px) scale(1.02); filter: blur(10px) brightness(1.5); }
+	}
+	.demon-eye-glow {
+		position: absolute; top: 15%; left: 50%; transform: translateX(-50%);
+		width: 40vmin; height: 50vmin; pointer-events: none;
+		background: 
+			radial-gradient(circle at 35% 30%, rgba(255,0,0,0.4) 0%, transparent 20%),
+			radial-gradient(circle at 65% 30%, rgba(255,0,0,0.4) 0%, transparent 20%);
+		animation: eyeFlicker 0.2s infinite;
+	}
+	@keyframes eyeFlicker {
+		0%, 100% { opacity: 0.3; }
+		50% { opacity: 1; }
+	}
+	@keyframes screenShake {
+		0%, 100% { transform: translate(0,0); }
+		25% { transform: translate(-2px, 2px); }
+		50% { transform: translate(2px, -2px); }
+		75% { transform: translate(-2px, -2px); }
+	}
+	.scene-grey.shaking {
+		animation: greyDecay 3s ease-out forwards, screenShake 0.15s infinite;
+	}
+	@keyframes demonLoom { 
+		0% { opacity: 0; transform: translateX(-50%) scale(0.9) translateY(40px); } 
+		100% { opacity: 1; transform: translateX(-50%) scale(1.1) translateY(0); } 
+	}
+	.grey-desaturate {
+		position: absolute; inset: 0;
+		background: linear-gradient(180deg, rgba(100,100,100,0) 0%, rgba(30,30,30,0.85) 100%);
+		animation: decaySpread 4s ease-out forwards;
+	}
+	@keyframes decaySpread { 0% { opacity: 0; } 100% { opacity: 1; } }
+	.fog {
+		position: absolute; width: 200%; height: 50%; border-radius: 50%;
+		background: radial-gradient(ellipse at center, rgba(180,180,180,0.5) 0%, transparent 70%);
+		filter: blur(20px);
+	}
+	.fog-1 { bottom: -10%; left: -50%; animation: fogDrift 10s ease-in-out infinite alternate; }
+	.fog-2 { bottom: 20%; left: -30%; animation: fogDrift 14s ease-in-out infinite alternate-reverse; opacity: 0.6; }
+	.fog-3 { bottom: 40%; left: -40%; animation: fogDrift 18s ease-in-out infinite alternate; opacity: 0.3; }
+	@keyframes fogDrift { 0% { transform: translateX(-5%); } 100% { transform: translateX(5%); } }
+	.ash-layer { position: absolute; inset: 0; }
+	.ash-particle {
+		position: absolute; top: -5%; border-radius: 2px; background: rgba(150,150,150,0.8);
+		animation: ashFall linear infinite;
+	}
+	@keyframes ashFall {
+		0% { transform: translateY(0) rotate(0deg); opacity: 0; }
+		10% { opacity: 1; }
+		90% { opacity: 0.6; }
+		100% { transform: translateY(110vh) rotate(720deg) translateX(40px); opacity: 0; }
+	}
+
+	/* SCENE 3: THE SPOTLIGHT — Divine Space */
+	.scene-spotlight { 
+		background: #050510;
+		overflow: hidden;
+		display: flex; align-items: center; justify-content: center;
+	}
+	.cosmos-shimmer {
+		position: absolute; inset: 0;
+		background: radial-gradient(circle at 30% 30%, rgba(108, 92, 231, 0.08) 0%, transparent 70%);
+		filter: blur(60px);
+		animation: mistFloat 20s infinite alternate ease-in-out;
+	}
+	@keyframes mistFloat {
+		from { transform: translate(-2%, -2%) scale(1); }
+		to { transform: translate(2%, 2%) scale(1.05); }
+	}
+	.central-spotlight {
+		position: absolute; inset: 0;
+		background: radial-gradient(circle at center, rgba(255, 255, 255, 0.12) 0%, transparent 50%);
+		z-index: 2;
+		filter: blur(20px);
+		mask-image: radial-gradient(circle at center, black 10%, transparent 80%);
+	}
+	.gold-particle {
+		position: absolute; width: 3px; height: 3px; background: #fff; border-radius: 50%;
+		left: var(--x); top: var(--y); opacity: 0;
+		animation: divineSparkle 5s infinite ease-in-out var(--delay);
+		box-shadow: 0 0 15px rgba(255,255,255,0.8);
+	}
+
+	/* SCENE 4: THE GOLDEN HORIZON — Painterly Golden Hour */
+	.scene-hero { 
+		background: linear-gradient(180deg, #574b90 0%, #e17055 45%, #f9ca24 100%); 
+		overflow: hidden;
+	}
+	.golden-hills { position: absolute; inset: 0; pointer-events: none; }
+	.hill-layer { 
+		position: absolute; bottom: -5%; width: 140%; left: -20%; 
+		/* Organic hand-drawn hill shapes */
+		border-radius: 60% 40% 0 0 / 100% 80% 0 0;
+	}
+	.hill-far { height: 45vh; background: #c0392b; opacity: 0.25; transform: rotate(-2deg) translateX(5%); }
+	.hill-mid { height: 38vh; background: #d35400; opacity: 0.45; transform: rotate(3deg) translateX(-5%); border-radius: 40% 60% 0 0 / 80% 100% 0 0; }
+	.hill-near { height: 32vh; background: #f39c12; opacity: 0.7; transform: rotate(-1deg); border-radius: 55% 45% 0 0 / 90% 90% 0 0; }
+	
+	.valley-fog {
+		position: absolute; bottom: 0; width: 100%; height: 15vh;
+		background: linear-gradient(to top, rgba(255,255,255,0.15), transparent);
+		filter: blur(25px);
+		mix-blend-mode: soft-light;
+	}
+
+	.energy-spark {
+		position: absolute; bottom: -20px; left: var(--x); width: 5px; height: 5px;
+		background: #f1c40f; border-radius: 50%; box-shadow: 0 0 12px #f1c40f;
+		animation: riseEnergyWobble 6s infinite ease-out var(--delay);
+	}
+	@keyframes riseEnergyWobble {
+		0% { transform: translateY(0) translateX(0) scale(1); opacity: 0; }
+		20% { opacity: 0.7; }
+		50% { transform: translateY(-50vh) translateX(20px) scale(1.2); }
+		100% { transform: translateY(-110vh) translateX(-20px) scale(0.5); opacity: 0; }
+	}
+
+	.hero-trail {
+		position: absolute; inset: -20px; border-radius: 50%;
+		background: radial-gradient(circle, rgba(255,255,255,0.3) 0%, transparent 75%);
+		filter: blur(15px); opacity: 0;
+		animation: trailPulseHero 0.4s infinite;
+	}
+	@keyframes trailPulseHero {
+		0% { transform: scale(1); opacity: 0.5; }
+		100% { transform: scale(1.6); opacity: 0; }
+	}
+	
+	/* DIVINE FLOAT (Box 3 Only) */
+	.divine-float {
+		animation: divineFloatAnim 6s infinite ease-in-out !important;
+	}
+	@keyframes divineFloatAnim {
+		0%, 100% { transform: translateY(0) scale(1); }
+		50% { transform: translateY(-15px) scale(1.05); }
+	}
+
+	.victory-flash-overlay {
+		position: absolute; inset: 0; background: #fff; z-index: 1000;
+		pointer-events: none; opacity: 0;
+		animation: victoryFlash 1.5s ease-out forwards;
+	}
+	@keyframes victoryFlash {
+		0% { opacity: 1; }
+		100% { opacity: 0; }
+	}
+
+	.salto-anim {
+		animation: quadraSalto 2.2s cubic-bezier(0.4, 0, 0.2, 1) forwards !important;
+	}
+	@keyframes quadraSalto {
+		0% { transform: translateY(100vh) rotate(0deg) scale(1, 1); opacity: 0; }
+		5% { opacity: 1; transform: translateY(100vh) scale(1.3, 0.7); } /* Deep Squash */
+		20% { transform: translateY(40vh) scale(0.8, 1.4); } /* Stretch Up */
+		45% { transform: translateY(-180px) rotate(180deg) scale(1, 1); } /* Mid-Air */
+		75% { transform: translateY(30px) rotate(340deg) scale(1, 1); } 
+		85% { transform: translateY(0) rotate(360deg) scale(1.4, 0.6); } /* Landing Squash */
+		100% { transform: translateY(0) rotate(360deg) scale(1, 1); opacity: 1; }
+	}
+
+	.spotlight-center-container {
+		position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+		display: flex; justify-content: center; align-items: center;
+		width: 100%; height: 100%; pointer-events: none;
+	}
+
+	.spotlight {
+		position: absolute; width: 60vmin; height: 60vmin; border-radius: 50%;
+		background: radial-gradient(circle, rgba(255,234,167,0.35) 0%, rgba(255,180,50,0.1) 40%, transparent 70%);
+		animation: spotlightPulse 2.5s ease-in-out infinite;
+		box-shadow: 0 0 80px 40px rgba(255,200,80,0.2);
+	}
+	@keyframes spotlightPulse {
+		0%, 100% { transform: translate(-50%,-50%) scale(1); opacity: 0.7; }
+		50% { transform: translate(-50%,-50%) scale(1.35); opacity: 1; }
+	}
+	.swirl-ring {
+		position: absolute; top: 50%; left: 50%; border-radius: 50%;
+		border: 2px solid rgba(255,234,167,0.5); animation: swirlExpand 4s ease-out infinite;
+	}
+	.swirl-1 { width:100px; height:100px; margin:-50px 0 0 -50px; animation-delay:0s; }
+	.swirl-2 { width:160px; height:160px; margin:-80px 0 0 -80px; animation-delay:0.8s; }
+	.swirl-3 { width:230px; height:230px; margin:-115px 0 0 -115px; animation-delay:1.6s; }
+	@keyframes swirlExpand {
+		0% { transform: scale(0.5) rotate(0deg); opacity: 0.9; }
+		100% { transform: scale(2.8) rotate(180deg); opacity: 0; }
+	}
+	.hero-quadra {
+		position: absolute; display: flex; flex-direction: column; align-items: center;
+		z-index: 10;
+	}
+	/* Unified centering logic */
+	.scene-dawn .hero-quadra, .scene-hope .hero-quadra { 
+		position: relative; top: auto; left: auto; transform: none; 
+	}
+	
+	.kingdom-backdrop {
+		position: absolute; inset: 0;
+		background: url('/majestic_kingdom_pixel_art_1777234504807.png') no-repeat center center;
+		background-size: cover;
+		opacity: 0.9;
+		z-index: -1;
+		filter: brightness(1.2) contrast(1.1);
+	}
+	@keyframes rayRotate { from { transform: rotate(0); } to { transform: rotate(360deg); } }
+	
+	@keyframes winkAnim {
+		0%, 100% { transform: scaleY(1); }
+		50% { transform: scaleY(0.1); }
+	}
+
+	.wonder-sun-happy { display: none; } /* Hide old static image sun */
+	.hero-glow {
+		position: absolute; width: 140px; height: 140px; border-radius: 50%;
+		background: radial-gradient(circle, rgba(255,234,167,0.7) 0%, transparent 70%);
+		animation: heroGlowPulse 2s ease-in-out infinite; top: -20px; left: -20px;
+	}
+	/* HERO SCENE VFX */
+	.rainbow-burst {
+		position: absolute; inset: 0;
+		background: radial-gradient(circle, transparent 20%, rgba(255,0,0,0.1) 40%, rgba(255,255,0,0.1) 60%, rgba(0,255,0,0.1) 80%);
+		animation: rainbowPulse 4s infinite;
+	}
+	@keyframes rainbowPulse {
+		0%, 100% { transform: scale(1); opacity: 0.3; }
+		50% { transform: scale(1.5); opacity: 0.6; filter: hue-rotate(90deg); }
+	}
+	.stars-layer { position: absolute; inset: 0; pointer-events: none; }
+	.star {
+		position: absolute; top: 50%; left: 50%; font-size: 2rem;
+		transform: rotate(calc(var(--r) * 24deg)) translateY(-40vh);
+		animation: starTwinkle 2s infinite var(--d);
+	}
+	@keyframes starTwinkle {
+		0%, 100% { opacity: 0; transform: rotate(calc(var(--r) * 24deg)) translateY(-40vh) scale(0); }
+		50% { opacity: 1; transform: rotate(calc(var(--r) * 24deg)) translateY(-45vh) scale(1.5); }
+	}
+	.hero-glow-rainbow {
+		background: radial-gradient(circle, rgba(255,255,255,0.8) 0%, transparent 70%);
+		filter: drop-shadow(0 0 30px #ff00ff) drop-shadow(0 0 60px #00ffff);
+	}
+	@keyframes heroGlowPulse {
+		0%, 100% { transform: scale(1); opacity: 0.6; }
+		50% { transform: scale(1.5); opacity: 1; }
+	}
+	.hero-cubie {
+		animation: hopeFloat 3s ease-in-out infinite;
+		box-shadow: 0 0 50px 20px rgba(255,234,167,0.7), 0 15px 25px rgba(0,0,0,0.5) !important;
+	}
+	@keyframes hopeFloat {
+		0%, 100% { transform: translateY(0); }
+		50% { transform: translateY(-20px); }
+	}
+	.light-mote {
+		position: absolute; border-radius: 50%; background: rgba(255,234,167,0.9);
+		box-shadow: 0 0 10px 4px rgba(255,200,80,0.7); animation: floatUp linear infinite;
+	}
+	@keyframes floatUp {
+		0% { transform: translateY(0) scale(1); opacity: 0; }
+		15% { opacity: 1; }
+		85% { opacity: 0.8; }
+		100% { transform: translateY(-80vh) scale(0.3); opacity: 0; }
+	}
+
+	/* SCENE 4: THE START — White Flash Burst */
+	.story-scene-dawn { background: #0a0010; }
+	.scene-dawn { background: #fff; animation: dawnFlash 3s ease-out forwards; }
+	@keyframes dawnFlash {
+		0% { background: #0a0a2a; filter: brightness(0.4); }
+		50% { background: #ffeaa7; filter: brightness(1.3); }
+		100% { background: #fff; filter: brightness(2.5); }
+	}
+	.dawn-core {
+		position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%);
+		width: 20vmin; height: 20vmin; border-radius: 50%;
+		background: radial-gradient(circle, #fff 0%, rgba(255,234,167,0.9) 40%, transparent 70%);
+		box-shadow: 0 0 160px 90px rgba(255,255,255,0.9);
+		animation: coreExpand 3s ease-out forwards;
+	}
+	@keyframes coreExpand {
+		0% { transform: translate(-50%,-50%) scale(0); opacity: 1; }
+		100% { transform: translate(-50%,-50%) scale(8); opacity: 0; }
+	}
+	.dawn-ring {
+		position: absolute; top: 50%; left: 50%; border-radius: 50%;
+		border: 4px solid rgba(255,255,255,0.9); animation: ringExpand 3s ease-out forwards;
+	}
+	.ring-1 { width:20vmin; height:20vmin; margin:-10vmin; animation-delay:0.3s; }
+	.ring-2 { width:20vmin; height:20vmin; margin:-10vmin; animation-delay:0.8s; }
+	.ring-3 { width:20vmin; height:20vmin; margin:-10vmin; animation-delay:1.3s; }
+	@keyframes ringExpand {
+		0% { transform: scale(0); opacity: 1; }
+		100% { transform: scale(12); opacity: 0; }
+	}
+
+	/* STORY TEXT BOX — base */
+	.rpg-text-box { position: relative; z-index: 10; margin-bottom: 8vh; }
+	.cute-box {
+		width: 65vw; max-width: 900px; min-height: 160px;
+		background: rgba(255, 255, 255, 0.92); border: 6px solid #74b9ff;
+		border-radius: 28px; padding: 30px 44px 52px 44px;
+		box-shadow: 0 20px 50px rgba(0,0,0,0.4), inset 0 0 20px rgba(116,185,255,0.15);
+		color: #2d3436; font-family: 'Lilita One', sans-serif; font-size: 1.75rem;
+		line-height: 1.65; letter-spacing: 0.4px;
+		position: relative; backdrop-filter: blur(12px);
+		transition: background 0.5s ease, border-color 0.5s ease, color 0.5s ease;
+	}
+	/* Dark scenes (grey + hope) get a dark glassmorphism box */
+	.story-scene-grey .cute-box,
+	.story-scene-hope .cute-box {
+		background: rgba(0, 0, 0, 0.5);
+		backdrop-filter: blur(15px);
+		border-color: rgba(255, 234, 167, 0.4);
+		color: #ffeaa7;
+		box-shadow: 0 20px 50px rgba(0,0,0,0.7), inset 0 0 20px rgba(255,234,167,0.05);
+	}
+	.story-scene-grey .story-scene-label { color: #b2bec3; }
+	.story-scene-hope .story-scene-label { color: #ffd32a; }
+	/* Dawn scene gets warm white */
+	.story-scene-dawn .cute-box {
+		background: rgba(255, 255, 255, 0.75);
+		border-color: rgba(255,200,50,0.8);
+		color: #2d1a00;
+	}
+	.story-body { margin: 0; }
+	.story-scene-label {
+		font-size: 0.9rem; color: #74b9ff; margin: 0 0 10px 0;
+		letter-spacing: 3px; text-transform: uppercase;
+	}
+	.click-to-continue {
+		position: absolute; bottom: 14px; right: 28px;
+		font-size: 1.2rem; color: #0984e3;
+		animation: pulseContinue 1.2s ease-in-out infinite;
+	}
+	.story-scene-hope .click-to-continue,
+	.story-scene-grey .click-to-continue { color: #ffeaa7; }
+	@keyframes pulseContinue { 0%, 100% { opacity: 1; } 50% { opacity: 0.15; } }
+
+	/* LOADING SCREEN */
+	.loading-screen {
+		position: absolute; inset: 0; z-index: 70;
+		background: #2d3436; display: flex; flex-direction: column;
+		justify-content: center; align-items: center; gap: 40px;
+	}
+	.loading-bounce {
+		animation: loaderBounce 0.8s infinite alternate cubic-bezier(0.4, 0, 0.2, 1);
+		box-shadow: 0 20px 30px rgba(0,0,0,0.5);
+	}
+	@keyframes loaderBounce {
+		0% { transform: translateY(0) scale(1, 1); }
+		100% { transform: translateY(-60px) scale(0.9, 1.1); }
+	}
+	.loading-text {
+		color: #fff; font-size: 2rem; letter-spacing: 2px;
+		animation: blinker 1.5s infinite ease-in-out;
+	}
+
+	/* --- LOADING SCREEN: KINGDOM MEADOW --- */
+	.kingdom-loading {
+		background: #55efc4; overflow: hidden; position: relative;
+		display: flex; flex-direction: column; align-items: center; justify-content: center;
+		width: 100vw; height: 100vh;
+	}
+	.loading-meadow {
+		position: absolute; bottom: 0; left: 0; width: 100%; height: 35vh;
+		background: #00b894; border-top: 15px solid #00cec9;
+	}
+	.loading-run {
+		animation: runInPlace 0.4s infinite alternate; z-index: 10;
+		transform-origin: bottom center; margin-bottom: 5vh;
+	}
+	@keyframes runInPlace {
+		0% { transform: translateY(0) rotate(-5deg); }
+		100% { transform: translateY(-30px) rotate(5deg); }
+	}
+
+	.loading-text {
+		color: #fff; font-size: 2.5rem; letter-spacing: 2px; z-index: 10;
+		text-shadow: 0 4px 10px rgba(0,0,0,0.3);
+		animation: blinker 1.5s infinite ease-in-out;
+	}
+
+	/* --- LEVEL SELECT: KNUFFIGES KÖNIGREICH --- */
+	.level-select-screen {
+		position: absolute; inset: 0; z-index: 80;
+		display: flex; flex-direction: column; align-items: center; justify-content: flex-start;
+		background: #74b9ff; overflow: hidden; padding-top: 5vh;
+	}
+	.kingdom-bg {
+		position: absolute; inset: 0; z-index: 1; pointer-events: none;
+	}
+	.k-sky {
+		position: absolute; inset: 0; background: linear-gradient(180deg, #74b9ff 0%, #a29bfe 100%);
+	}
+	.k-sun {
+		position: absolute; top: 10%; right: 15%; width: 120px; height: 120px;
+		background: #ffeaa7; border-radius: 50%; box-shadow: 0 0 50px #fdcb6e;
+		animation: sunPulse 4s infinite alternate;
+	}
+	@keyframes sunPulse { 0% { transform: scale(1); } 100% { transform: scale(1.1); } }
+	
+	.k-cloud {
+		position: absolute; width: 150px; height: 50px; background: #fff; border-radius: 50px;
+		animation: cloudFloat 20s linear infinite;
+	}
+	.k-cloud::before { content: ''; position: absolute; width: 70px; height: 70px; background: #fff; border-radius: 50%; top: -30px; left: 20px; }
+	.k-cloud::after { content: ''; position: absolute; width: 50px; height: 50px; background: #fff; border-radius: 50%; top: -20px; left: 80px; }
+	@keyframes cloudFloat { 0% { transform: translateX(-200px); } 100% { transform: translateX(120vw); } }
+
+	.k-hills {
+		position: absolute; bottom: -5vh; left: -10vw; width: 120vw; height: 45vh;
+		background: #55efc4; border-radius: 50% 50% 0 0; border-top: 15px solid #00b894;
+	}
+	.k-river {
+		position: absolute; bottom: 0; left: 40%; width: 20%; height: 40vh;
+		background: #0984e3; clip-path: polygon(40% 0, 60% 0, 100% 100%, 0 100%);
+	}
+
+	.level-select-title {
+		position: relative; z-index: 10; font-size: 4rem; color: #fff;
+		text-shadow: 0 5px 0 #0984e3, 0 10px 20px rgba(0,0,0,0.3);
+		margin-bottom: 50px; 
+	}
+
+	.levels-container {
+		position: relative; z-index: 10; width: 100%; height: 70vh;
+	}
+	
+	.k-level-node {
+		position: absolute; background: none; border: none; cursor: pointer;
+		display: flex; flex-direction: column; align-items: center; gap: 15px;
+		transition: transform 0.2s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+	}
+	.k-level-node.active-node:hover { transform: scale(1.15) translateY(-10px); }
+	
+	.node-label {
+		background: #fff; color: #2d3436; padding: 10px 20px; border-radius: 20px;
+		font-size: 1.5rem; border: 4px solid #fdcb6e; box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+	}
+
+	/* ICONS */
+	.node-icon { width: 120px; height: 120px; position: relative; display: flex; justify-content: center; }
+	
+	.windmill .wm-base {
+		position: absolute; bottom: 0; width: 60px; height: 80px;
+		background: #e17055; border-radius: 20px 20px 0 0; border: 4px solid #fff;
+	}
+	.windmill .wm-blades {
+		position: absolute; top: 10px; width: 10px; height: 100px;
+		background: #fff; transform-origin: center; animation: spinBlade 4s linear infinite;
+	}
+	.windmill .wm-blades::before {
+		content: ''; position: absolute; top: 45px; left: -45px; width: 100px; height: 10px; background: #fff;
+	}
+	@keyframes spinBlade { 100% { transform: rotate(360deg); } }
+
+	.ice-castle .ic-tower { position: absolute; bottom: 0; background: #74b9ff; width: 30px; height: 60px; border-radius: 10px 10px 0 0; border: 4px solid #fff;}
+	.ice-castle .ic-tower:nth-child(1) { left: 10px; }
+	.ice-castle .ic-tower.tall { left: 45px; height: 90px; background: #0984e3; z-index: 2;}
+	.ice-castle .ic-tower:nth-child(3) { left: 80px; }
+
+	.volcano .vc-body {
+		position: absolute; bottom: 0; left: 10px; width: 100px; height: 80px;
+		background: #2d3436; clip-path: polygon(30% 0, 70% 0, 100% 100%, 0 100%);
+	}
+	.volcano .vc-lava {
+		position: absolute; top: 0; left: 40px; width: 40px; height: 30px;
+		background: #d63031; border-radius: 0 0 20px 20px;
+	}
+
+	.locked-node { filter: grayscale(1) opacity(0.8); cursor: not-allowed; }
+	.lock-icon { position: absolute; top: -20px; right: -20px; font-size: 2.5rem; filter: drop-shadow(0 2px 5px rgba(0,0,0,0.5)); }
 
 </style>
