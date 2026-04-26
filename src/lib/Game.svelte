@@ -4,12 +4,19 @@
 
 	let { width = '100vw', height = '100vh' } = $props();
 	
-	// STATE MACHINE: PRE_START -> INTRO -> MENU -> TRANSITION_FLOWER -> STORY -> LOADING -> LEVEL_SELECT -> PLAY
+	// STATE MACHINE: PRE_START -> INTRO -> MENU -> TRANSITION_FLOWER -> STORY -> CREDITS -> LOADING -> LEVEL_SELECT -> PLAY
 	let appState = $state('PRE_START'); 
 	let transitionActive = $state(false);
 	let isHoveringStart = $state(false);
+	let isCreditsOpen = $state(false);
+	let isSettingsOpen = $state(false);
 	let panFinished = $state(false);
 	let isWinking = $state(false);
+
+	// SETTINGS STATES
+	let musicVolume = $state(0.4);
+	let isSFXEnabled = $state(true);
+	let typingSpeedMode = $state('normal'); // slow, normal, fast
 
 	// ============================================================
 	// STORY CONFIG — TIMESTAMPS (adjust to your story-voice.mp3!)
@@ -22,25 +29,25 @@
 		{
 			text: "Once, the kingdom shined in endless colors. The light of the crystals brought joy and life to every living soul.",
 			startTime: 0,     
-			endTime: 8.5,     
+			endTime: 7.3625,     
 			scene: "meadow"
 		},
 		{
 			text: "But a dark, nameless power has stolen the radiance, shroudding the world in grey shadows. all lives seems frozen...",
-			startTime: 9.0,
-			endTime: 18.0,
+			startTime: 7.5,
+			endTime: 14.8,
 			scene: "grey"
 		},
 		{
 			text: "Quadra, you are the only one who can break the darkness. Journey through the forgotten lands, find the lost fragments, and bring back the light!",
-			startTime: 18.5,
-			endTime: 30.0,
+			startTime: 15.0,
+			endTime: 24.2,
 			scene: "hope"
 		},
 		{
 			text: "The adventure begins... now.",
-			startTime: 30.5,
-			endTime: 34.0,
+			startTime: 24.5,
+			endTime: 28.0,
 			scene: "dawn"
 		}
 	];
@@ -121,22 +128,50 @@
 
 	function toggleMute() {
 		isMuted = !isMuted;
-		if (globalGain && audioContext) {
-			globalGain.gain.setTargetAtTime(isMuted ? 0 : 1, audioContext.currentTime, 0.05);
-		}
+		updateVolume();
 	}
 
-	function fadeOutMusic() {
+	function updateVolume() {
+		// Dips volume when in Settings or Credits for better focus
+		const reduction = (isSettingsOpen || appState === 'CREDITS') ? 0.4 : 1.0;
+		const finalVolume = isMuted ? 0 : musicVolume * reduction;
+
+		// ENFORCE: The Menu Theme (Web Audio) must be SILENT if we are in Game States
+		const isMenuState = (appState === 'PRE_START' || appState === 'INTRO' || appState === 'MENU' || appState === 'CREDITS');
+		
 		if (globalGain && audioContext) {
-			globalGain.gain.setTargetAtTime(0, audioContext.currentTime, 0.4); 
+			const targetWebAudioVol = isMenuState ? finalVolume : 0;
+			globalGain.gain.setTargetAtTime(targetWebAudioVol, audioContext.currentTime, 0.1);
+		}
+		
+		const mapMusic = document.getElementById('map-theme-audio');
+		if (mapMusic) mapMusic.volume = finalVolume;
+	}
+
+	$effect(() => {
+		// This effect tracks musicVolume, isMuted, isSettingsOpen, and appState
+		updateVolume();
+	});
+
+	function fadeOutMusic() {
+		if (schedulingInterval) {
+			clearInterval(schedulingInterval);
+			schedulingInterval = null;
+		}
+		nextStartTime = -1; // Stop scheduling new nodes
+		
+		if (globalGain && audioContext) {
+			// Fast but smooth fade to absolute zero
+			globalGain.gain.setTargetAtTime(0, audioContext.currentTime, 0.2); 
 		}
 	}
 
 	function playClick() {
+		if (!isSFXEnabled) return;
 		try {
 			const clickSound = document.getElementById('click-audio');
 			if (clickSound) {
-				clickSound.volume = 0.6; // Weicherer Klick-Sound
+				clickSound.volume = 0.6 * musicVolume; // Scale with music for consistency or keep separate
 				clickSound.currentTime = 0;
 				clickSound.play().catch(e => console.log('SFX block', e));
 			}
@@ -163,53 +198,40 @@
 	}
 
 	function startGame(e) {
-		e.stopPropagation();
+		if (e && e.stopPropagation) e.stopPropagation();
 		transitionActive = true;
 		
-		// Fade out the menu music as requested
+		// 1. Stop Menu Theme IMMEDIATELY
 		fadeOutMusic();
 
-		// Fade in map theme
-		try {
-			const mapTheme = document.getElementById('map-theme-audio');
-			if (mapTheme) {
-				mapTheme.volume = 0;
-				mapTheme.play().catch(err => console.log('Map theme block', err));
-				let vol = 0;
-				let fade = setInterval(() => {
-					vol += 0.05;
-					if (vol >= 0.6) {
-						clearInterval(fade);
-						mapTheme.volume = 0.6;
-					} else {
-						mapTheme.volume = vol;
-					}
-				}, 100);
-			}
-		} catch(err) {}
+		// 2. Fire Confetti
+		if (e && e.target) {
+			const rect = e.target.getBoundingClientRect();
+			fireConfetti(rect.left + rect.width / 2, rect.top + rect.height / 2);
+		}
 
-		// Play cinematic start click
-		try {
-			const startClickSound = document.getElementById('click-effect-audio');
-			if (startClickSound) {
-				startClickSound.volume = 0.8;
-				startClickSound.currentTime = 0;
-				startClickSound.play().catch(err => console.log('SFX block', err));
-			}
-		} catch(err) {}
-
-		const rect = e.target.getBoundingClientRect();
-		fireConfetti(rect.left + rect.width / 2, rect.top + rect.height / 2);
-
-		appState = 'TRANSITION_FLOWER';
-
+		// 3. Sequential state changes
 		setTimeout(() => {
-			appState = 'STORY';
-			transitionActive = false;
-			particles = [];
-			currentStoryBox = 0;
-			startTypewriter();
-		}, 5000);
+			appState = 'TRANSITION_FLOWER';
+			
+			// GIVE THE TRANSITION (MOMENT OF SILENCE) 5 SECONDS
+			setTimeout(() => {
+				appState = 'STORY';
+				transitionActive = false;
+				particles = [];
+				currentStoryBox = 0;
+				
+				// 4. START MAP THEME NOW (After the transition silence)
+				const mapMusic = document.getElementById('map-theme-audio');
+				if (mapMusic) {
+					mapMusic.currentTime = 0;
+					mapMusic.volume = musicVolume;
+					mapMusic.play().catch(() => {});
+				}
+				
+				startTypewriter();
+			}, 5000); 
+		}, 800);
 	}
 
 	// ── AUDIO CLEANUP (Ghost Music Prevention) ──
@@ -231,49 +253,42 @@
 	});
 
 	function startTypewriter() {
-		const storyVoice = document.getElementById('story-voice-audio');
+		if (storyInterval) clearInterval(storyInterval);
 		isBlockFinished = false;
 		displayedStoryText = "";
 		let i = 0;
-		if (storyInterval) clearInterval(storyInterval);
-
 		const currentBox = storyConfig[currentStoryBox];
 		const currentText = currentBox.text;
-
-		// --------------------------------------------------------
-		// Shared trigger: called by EITHER audio segment end
-		// OR typewriter fallback — whichever fires first
-		// --------------------------------------------------------
+		const storyVoice = document.getElementById('story-voice-audio');
 		let triggered = false;
-		function triggerBlockFinished() {
+
+		const triggerBlockFinished = () => {
 			if (triggered) return;
 			triggered = true;
 			isBlockFinished = true;
-			// Unducking: Raise active music back to 60%
-			fadeAudio('map-theme-audio', 0.6, 600);
-			fadeAudio('corruption-theme-audio', 0.6, 600);
-		}
+			// Unducking: Restore music volume for whichever track is currently active
+			const activeMusicId = (currentStoryBox === 1) ? 'demon-theme-audio' : 'map-theme-audio';
+			fadeAudio(activeMusicId, 0.6, 600);
+		};
 
-		if (storyVoice) {
-			// Remove any old timeupdate handler first
+		// 1. NARRATION LOGIC (Only if timestamps are defined)
+		if (storyVoice && currentBox.startTime !== undefined && currentBox.endTime !== undefined) {
+			// Clean up previous listeners
 			if (storyTimeupdateHandler) {
 				storyVoice.removeEventListener('timeupdate', storyTimeupdateHandler);
-				storyTimeupdateHandler = null;
 			}
-			storyVoice.onended = null;
-
-			// DUCKING: Reduce volume of ALL background music while narrator speaks
-			fadeAudio('map-theme-audio', 0.2, 400);
-			fadeAudio('corruption-theme-audio', 0.2, 400);
-
-			// seek to this box's segment and play
+			
+			storyVoice.playbackRate = (currentStoryBox === 0) ? 0.95 : 1.0;
 			storyVoice.currentTime = currentBox.startTime;
-			storyVoice.play().catch(err => console.log('Voice block', err));
+			
+			// Ducking: Lower music while speaking
+			fadeAudio('map-theme-audio', 0.2, 400);
 
-			// ── TIMESTAMP GUARD: fires as soon as currentTime >= endTime ──
+			storyVoice.play().catch(() => {});
+
+			// Precise stop logic
 			storyTimeupdateHandler = () => {
 				if (storyVoice.currentTime >= currentBox.endTime) {
-					// Instantly pause — no dead air, no 20-second wait
 					storyVoice.pause();
 					storyVoice.removeEventListener('timeupdate', storyTimeupdateHandler);
 					storyTimeupdateHandler = null;
@@ -281,47 +296,51 @@
 				}
 			};
 			storyVoice.addEventListener('timeupdate', storyTimeupdateHandler);
-
-			// Safety: if audio ends before reaching endTime (file shorter than expected)
-			storyVoice.onended = () => {
-				if (storyTimeupdateHandler) {
-					storyVoice.removeEventListener('timeupdate', storyTimeupdateHandler);
-					storyTimeupdateHandler = null;
-				}
-				triggerBlockFinished();
-			};
-
-			// HARD DEADLINE
-			const segmentDuration = currentBox.endTime - currentBox.startTime;
-			setTimeout(() => {
-				if (!triggered) {
-					storyVoice.pause();
-					if (storyTimeupdateHandler) {
-						storyVoice.removeEventListener('timeupdate', storyTimeupdateHandler);
-						storyTimeupdateHandler = null;
+			
+			// 1a. MUSIC SWITCHING LOGIC (Wonder-style Scene Audio)
+			if (currentStoryBox === 1) { // Box 2 (The Decay / Demon King)
+				fadeAudio('map-theme-audio', 0, 500);
+				setTimeout(() => {
+					const demonMusic = document.getElementById('demon-theme-audio');
+					if (demonMusic) {
+						demonMusic.currentTime = 20; // Start at 20th second as requested
+						demonMusic.volume = 0;
+						demonMusic.play().catch(() => {});
+						fadeAudio('demon-theme-audio', 0.2, 500); // 0.2 because of ducking
 					}
-					triggerBlockFinished();
-				}
-			}, (segmentDuration + 1.0) * 1000);
+				}, 500);
+			} else if (currentStoryBox === 2) { // Box 3 (The Hope / Hero return)
+				fadeAudio('demon-theme-audio', 0, 500);
+				setTimeout(() => {
+					fadeAudio('map-theme-audio', 0.2, 500); // 0.2 because of ducking
+				}, 500);
+			}
+
+			// Safety timeout
+			const duration = (currentBox.endTime - currentBox.startTime) / storyVoice.playbackRate;
+			setTimeout(() => {
+				storyVoice.pause();
+				triggerBlockFinished();
+			}, (duration + 1) * 1000);
 		}
 
-		// Typewriter: EXACT calibration for millisecond sync if audio exists
-		let typingSpeed = 40; // Default speed for silent boxes
-		
-		if (currentBox.endTime !== undefined && currentBox.startTime !== undefined) {
-			const audioDurationForText = currentBox.endTime - currentBox.startTime;
-			typingSpeed = Math.max(20, Math.floor((audioDurationForText * 1000) / currentText.length));
+		// 2. TYPEWRITER SPEED CALCULATION
+		let typingSpeed = 40;
+		if (currentBox.startTime !== undefined && currentBox.endTime !== undefined && storyVoice) {
+			const durMs = ((currentBox.endTime - currentBox.startTime) / storyVoice.playbackRate) * 1000;
+			typingSpeed = Math.max(20, Math.floor(durMs / currentText.length));
 		}
 
+		// 3. TYPEWRITER EXECUTION
 		storyInterval = setInterval(() => {
 			if (i < currentText.length) {
 				displayedStoryText += currentText.charAt(i);
 				i++;
 			} else {
 				clearInterval(storyInterval);
-				// Fallback: if no audio, show button immediately after text
-				if (!storyVoice || storyVoice.paused) {
-					setTimeout(triggerBlockFinished, 400);
+				// If no audio is driving the 'finished' state, trigger it after typing
+				if (currentBox.startTime === undefined) {
+					setTimeout(triggerBlockFinished, 500);
 				}
 			}
 		}, typingSpeed);
@@ -330,16 +349,9 @@
 	function nextStoryBox() {
 		if (!isBlockFinished) return;
 		playClick();
-		currentStoryBox++;
 		
-		if (currentStoryBox < storyConfig.length) {
-			const scene = storyConfig[currentStoryBox].scene;
-			
-			// Audio logic simplified (keeping Map Theme consistent)
-			if (scene === 'grey') {
-				// We keep the map theme but maybe lower volume or keep as is
-			}
-			
+		if (currentStoryBox < storyConfig.length - 1) {
+			currentStoryBox++;
 			startTypewriter();
 		} else {
 			finishStory();
@@ -371,6 +383,8 @@
 			}
 		}, duration / steps);
 	}
+
+
 
 	function finishStory() {
 		if (storyInterval) clearInterval(storyInterval);
@@ -490,15 +504,15 @@
 	<link href="https://fonts.googleapis.com/css2?family=Lilita+One&display=swap" rel="stylesheet">
 </svelte:head>
 
-<div class="game-viewport bloom-scene {appState === 'TRANSITION_FLOWER' || appState === 'STORY' ? 'flower-bloom-active' : ''}" style="width: {width}; height: {height};">
+<div class="game-viewport bloom-scene {appState === 'TRANSITION_FLOWER' || appState === 'STORY' ? 'flower-bloom-active' : ''} {isSettingsOpen ? 'game-paused' : ''}" style="width: {width}; height: {height};">
 	<div class="texture-overlay"></div>
 
 	<!-- PRELOAD SOUNDS FOR INSTANT ZERO-LATENCY PLAYBACK -->
 	<audio id="click-audio" src="/audio/mixkit-select-click-1109.wav" preload="auto"></audio>
-	<audio id="click-effect-audio" src="/audio/mixkit-select-click-1109.wav" preload="auto"></audio>
+	<audio id="click-effect-audio" src="/audio/click-effect.mp3" preload="auto"></audio>
 	<audio id="story-voice-audio" src="/story-voice.mp3" preload="auto"></audio>
-	<!-- map-theme: rename the file from "map-theme.mp3.mp3" → "map-theme.mp3" in static/audio/ -->
 	<audio id="map-theme-audio" src="/audio/map-theme.mp3" loop preload="auto"></audio>
+	<audio id="demon-theme-audio" src="/audio/1-the-demon-king.mp3" loop preload="auto"></audio>
 
 	<!-- BACKGROUND VISUALS (Persistent layer, transitions smoothly) -->
 	{#if appState !== 'PLAY' && appState !== 'LEVEL_SELECT' && appState !== 'LOADING'}
@@ -603,8 +617,8 @@
 						START GAME
 					</button>
 					<div class="sub-buttons">
-						<button class="wonder-btn small-btn" onmousedown={playClick}>⚙ OPTIONS</button>
-						<button class="wonder-btn small-btn" onmousedown={playClick}>CREDITS</button>
+						<button class="wonder-btn small-btn" onmousedown={playClick} onclick={() => isSettingsOpen = true}>⚙ SETTINGS</button>
+						<button class="wonder-btn small-btn" onmousedown={playClick} onclick={() => appState = 'CREDITS'}>CREDITS</button>
 						<button class="wonder-btn small-btn mute-btn" onmousedown={playClick} onclick={toggleMute} aria-label="Toggle mute" title="Mute Audio">
 							{isMuted ? '🔈' : '🔊'}
 						</button>
@@ -766,7 +780,101 @@
 			</div>
 		</div>
 
-	{:else if appState === 'LOADING'}
+	{:else if appState === 'CREDITS'}
+
+		<!-- 🎬 CINEMATIC WONDER CREDITS -->
+		<div class="credits-overlay" in:fade={{ duration: 600 }} out:fade={{ duration: 400 }}>
+			<div class="credits-blur-bg"></div>
+			
+			<div class="credits-content">
+				<div class="rolling-container">
+					<div class="credit-section">
+						<h3>PROGRAMMING & DESIGN</h3>
+						<p>Leonit Begzati and Gemini AI</p>
+					</div>
+					<div class="credit-section">
+						<h3>CLASS / GRADE</h3>
+						<p>4BHK</p>
+					</div>
+					<div class="credit-section">
+						<h3>INSTITUTION</h3>
+						<p>JO HAK</p>
+					</div>
+					<div class="credit-section">
+						<h3>SPECIAL THANKS</h3>
+						<p>To the Wonder Kingdom</p>
+						<p>&</p>
+						<p>The Mystery of Quadra</p>
+					</div>
+					<div class="firework-trigger">✨</div>
+				</div>
+
+				<!-- MINI QUADRA PERFORMER -->
+				<div class="mini-quadra-performer">
+					<div class="cubie performer-anim">
+						<div class="eyes"><div class="eye"><div class="pupil"></div></div><div class="eye"><div class="pupil"></div></div></div>
+					</div>
+					<div class="performer-shadow"></div>
+				</div>
+			</div>
+
+			<!-- WONDER PARTICLES (STARS) -->
+			<div class="credits-stars">
+				{#each Array(12) as _, i}
+					<div class="laughing-star" style="--delay: {i * 1.5}s; --x: {10 + Math.random() * 80}%">⭐</div>
+				{/each}
+			</div>
+
+			<!-- CLOSE BUTTON (FLOWER/STAR) -->
+			<button class="credits-close-btn" onclick={() => appState = 'MENU'} onmousedown={playClick}>
+				<span class="btn-icon">🌸</span>
+				<span class="btn-text">BACK</span>
+			</button>
+		</div>
+
+	{/if}
+
+	<!-- ⚙️ SETTINGS OVERLAY (Global) -->
+	{#if isSettingsOpen}
+		<div class="settings-overlay" in:fade={{ duration: 300 }} out:fade={{ duration: 200 }}>
+			<div class="settings-modal" in:scale={{ duration: 400, start: 0.8, easing: cubicOut }}>
+				<button class="close-x" onclick={() => isSettingsOpen = false} onmousedown={playClick}>×</button>
+				
+				<h2 class="settings-title">SETTINGS</h2>
+
+				<div class="settings-groups">
+					<!-- MUSIC VOLUME -->
+					<div class="setting-item">
+						<label>MUSIC VOLUME: {Math.round(musicVolume * 100)}%</label>
+						<input type="range" min="0" max="1" step="0.01" bind:value={musicVolume} class="wonder-slider" />
+					</div>
+
+					<!-- SFX TOGGLE -->
+					<div class="setting-item flex-row">
+						<label>SOUND EFFECTS (SFX)</label>
+						<button class="toggle-btn {isSFXEnabled ? 'active' : ''}" onclick={() => isSFXEnabled = !isSFXEnabled}>
+							{isSFXEnabled ? 'ON' : 'OFF'}
+						</button>
+					</div>
+
+					<!-- TEXT SPEED -->
+					<div class="setting-item">
+						<label>TEXT SPEED</label>
+						<div class="speed-selector">
+							<button class={typingSpeedMode === 'slow' ? 'active' : ''} onclick={() => typingSpeedMode = 'slow'}>SLOW</button>
+							<button class={typingSpeedMode === 'normal' ? 'active' : ''} onclick={() => typingSpeedMode = 'normal'}>NORMAL</button>
+							<button class={typingSpeedMode === 'fast' ? 'active' : ''} onclick={() => typingSpeedMode = 'fast'}>FAST</button>
+						</div>
+					</div>
+				</div>
+
+				<button class="apply-btn" onclick={() => isSettingsOpen = false} onmousedown={playClick}>APPLY & CLOSE</button>
+			</div>
+		</div>
+	{/if}
+
+	<!-- APP CONTENT -->
+	{#if appState === 'LOADING'}
 
 		<!-- KNUFFIGER LOADING SCREEN -->
 		<div class="loading-screen kingdom-loading" in:fade={{ duration: 500 }} out:fade={{ duration: 800 }}>
@@ -1721,4 +1829,168 @@
 	.locked-node { filter: grayscale(1) opacity(0.8); cursor: not-allowed; }
 	.lock-icon { position: absolute; top: -20px; right: -20px; font-size: 2.5rem; filter: drop-shadow(0 2px 5px rgba(0,0,0,0.5)); }
 
+	/* ============================================
+	   CREDITS SEQUENZ (WONDER STYLE)
+	   ============================================ */
+	.credits-overlay {
+		position: absolute; inset: 0; z-index: 200;
+		display: flex; align-items: center; justify-content: center;
+		color: #fff; text-align: center;
+	}
+	.credits-blur-bg {
+		position: absolute; inset: 0;
+		background: rgba(44, 22, 84, 0.4);
+		backdrop-filter: blur(15px);
+		-webkit-backdrop-filter: blur(15px);
+	}
+	.credits-content {
+		position: relative; z-index: 10;
+		width: 80%; height: 100%;
+		display: flex; flex-direction: column; align-items: center;
+		overflow: hidden;
+	}
+	.rolling-container {
+		position: absolute; bottom: -100%;
+		display: flex; flex-direction: column; gap: 80px;
+		animation: rollCredits 25s linear forwards;
+	}
+	@keyframes rollCredits {
+		0% { bottom: -100%; }
+		100% { bottom: 120%; }
+	}
+	.credit-section h3 {
+		font-size: 1.2rem; color: #fdcb6e; letter-spacing: 4px; margin-bottom: 15px;
+		text-shadow: 0 4px 10px rgba(0,0,0,0.3);
+	}
+	.credit-section p {
+		font-size: 2.2rem; font-weight: bold; margin: 5px 0;
+		filter: drop-shadow(0 5px 15px rgba(0,0,0,0.5));
+	}
+	.firework-trigger {
+		font-size: 3rem; opacity: 0;
+		animation: creditFirework 1s ease-out forwards 24.5s;
+	}
+	@keyframes creditFirework {
+		0% { transform: scale(0); opacity: 0; }
+		50% { transform: scale(2); opacity: 1; filter: hue-rotate(360deg); }
+		100% { transform: scale(3); opacity: 0; filter: blur(20px); }
+	}
+
+	/* MINI QUADRA TRICKS */
+	.mini-quadra-performer {
+		position: absolute; right: 10%; bottom: 15%;
+		display: flex; flex-direction: column; align-items: center;
+	}
+	.performer-anim {
+		width: 60px; height: 60px; background: #fff; border-radius: 12px;
+		box-shadow: inset -4px -4px rgba(0,0,0,0.1), 4px 4px rgba(255,255,255,0.2);
+		animation: miniTricks 4s infinite cubic-bezier(0.45, 0.05, 0.55, 0.95);
+	}
+	@keyframes miniTricks {
+		0%, 100% { transform: translateY(0) rotate(0deg); }
+		20% { transform: translateY(-40px) rotate(180deg) scaleX(0.8) scaleY(1.2); }
+		40% { transform: translateY(0) rotate(360deg) scaleX(1.3) scaleY(0.7); }
+		60% { transform: translateY(-20px) rotate(-10deg) scale(1.1); }
+		80% { transform: translateY(0) rotate(10deg) scale(0.9); }
+	}
+	.performer-shadow {
+		width: 40px; height: 8px; background: rgba(0,0,0,0.2); border-radius: 50%; margin-top: 10px;
+		animation: shadowPulse 4s infinite;
+	}
+	@keyframes shadowPulse {
+		0%, 100%, 40%, 80% { transform: scaleX(1); opacity: 1; }
+		20%, 60% { transform: scaleX(0.5); opacity: 0.3; }
+	}
+
+	/* LAUGHING STARS */
+	.credits-stars { position: absolute; inset: 0; pointer-events: none; }
+	.laughing-star {
+		position: absolute; bottom: -50px; left: var(--x);
+		font-size: 2rem; opacity: 0.6;
+		animation: starFloatUp 12s linear infinite var(--delay);
+	}
+	@keyframes starFloatUp {
+		0% { transform: translateY(0) rotate(0deg); opacity: 0; }
+		20% { opacity: 0.8; }
+		100% { transform: translateY(-120vh) rotate(360deg); opacity: 0; }
+	}
+
+	.credits-close-btn {
+		position: absolute; bottom: 40px; z-index: 100;
+		background: #fff; border: none; border-radius: 50px;
+		padding: 15px 40px; display: flex; align-items: center; gap: 15px;
+		color: #2d3436; font-family: inherit; font-size: 1.5rem; font-weight: bold;
+		cursor: pointer; box-shadow: 0 10px 20px rgba(0,0,0,0.3);
+		transition: all 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+	}
+	.credits-close-btn:hover { transform: scale(1.1) translateY(-5px); box-shadow: 0 15px 30px rgba(0,0,0,0.4); }
+	.credits-close-btn .btn-icon { font-size: 2rem; }
+
+	/* ============================================
+	   SETTINGS ENGINE STYLES
+	   ============================================ */
+	.settings-overlay {
+		position: absolute; inset: 0; z-index: 500;
+		display: flex; align-items: center; justify-content: center;
+		background: rgba(0,0,0,0.3); backdrop-filter: blur(8px);
+	}
+	.settings-modal {
+		background: rgba(255, 255, 255, 0.9);
+		width: 450px; padding: 40px; border-radius: 40px;
+		border: 8px solid #74b9ff; box-shadow: 0 20px 60px rgba(0,0,0,0.4);
+		position: relative; text-align: center;
+	}
+	.close-x {
+		position: absolute; top: 15px; right: 25px;
+		background: none; border: none; font-size: 2.5rem; color: #74b9ff;
+		cursor: pointer; transition: transform 0.2s;
+	}
+	.close-x:hover { transform: scale(1.2) rotate(90deg); color: #0984e3; }
+
+	.settings-title {
+		font-size: 2rem; color: #0984e3; margin-bottom: 30px; letter-spacing: 2px;
+	}
+	.settings-groups { display: flex; flex-direction: column; gap: 25px; margin-bottom: 30px; }
+	
+	.setting-item { display: flex; flex-direction: column; align-items: center; gap: 10px; }
+	.setting-item.flex-row { flex-direction: row; justify-content: space-between; }
+	.setting-item label { font-weight: bold; color: #2d3436; font-size: 1.1rem; }
+
+	/* WONDER SLIDER */
+	.wonder-slider {
+		-webkit-appearance: none; width: 100%; height: 12px;
+		background: #dfe6e9; border-radius: 10px; outline: none;
+	}
+	.wonder-slider::-webkit-slider-thumb {
+		-webkit-appearance: none; width: 25px; height: 25px;
+		background: #74b9ff; border-radius: 50%; cursor: pointer;
+		border: 4px solid #fff; box-shadow: 0 4px 10px rgba(0,0,0,0.2);
+	}
+
+	/* TOGGLE & SPEED BUTTONS */
+	.toggle-btn, .speed-selector button {
+		background: #dfe6e9; border: none; padding: 10px 20px;
+		border-radius: 15px; font-family: inherit; font-weight: bold;
+		cursor: pointer; transition: all 0.2s; color: #636e72;
+	}
+	.speed-selector { display: flex; gap: 10px; }
+	.toggle-btn.active, .speed-selector button.active {
+		background: #74b9ff; color: #fff; transform: scale(1.05);
+		box-shadow: 0 5px 15px rgba(116, 185, 255, 0.4);
+	}
+
+	.apply-btn {
+		width: 100%; padding: 15px; border-radius: 20px;
+		background: #55efc4; border: none; color: #fff;
+		font-family: inherit; font-size: 1.4rem; font-weight: bold;
+		cursor: pointer; transition: all 0.3s;
+		box-shadow: 0 8px 0 #00b894; margin-top: 10px;
+	}
+	.apply-btn:hover { transform: translateY(-3px); box-shadow: 0 11px 0 #00b894; }
+	.apply-btn:active { transform: translateY(5px); box-shadow: 0 3px 0 #00b894; }
+
+	/* PAUSE LOGIC */
+	.game-paused * {
+		animation-play-state: paused !important;
+	}
 </style>
